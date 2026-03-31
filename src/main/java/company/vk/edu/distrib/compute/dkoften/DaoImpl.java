@@ -1,4 +1,4 @@
-package company.vk.edu.distrib.compute.dkoften;
+package company.vk.edu.distrib.compute.dkoften.storage;
 
 import company.vk.edu.distrib.compute.Dao;
 import org.slf4j.Logger;
