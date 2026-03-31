@@ -2,12 +2,14 @@ package company.vk.edu.distrib.compute.dkoften;
 
 import company.vk.edu.distrib.compute.Dao;
 import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -20,14 +22,14 @@ public class DaoImpl implements Dao<byte[]> {
 
     private final Map<String, byte[]> loadedStorage = new ConcurrentHashMap<>();
 
-    private final Logger logger = org.slf4j.LoggerFactory.getLogger("dao");
+    private final Logger logger = LoggerFactory.getLogger("dao");
 
     public DaoImpl(String path) {
         storage = Path.of(path);
         try {
             loadFromFile();
         } catch (IOException e) {
-            throw new RuntimeException("Failed to load data from file", e);
+            throw new UncheckedIOException("Failed to load data from file", e);
         }
     }
 
