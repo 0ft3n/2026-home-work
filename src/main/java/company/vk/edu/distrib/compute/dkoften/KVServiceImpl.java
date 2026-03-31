@@ -11,21 +11,17 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.InetSocketAddress;
 import java.util.NoSuchElementException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 public final class KVServiceImpl implements KVService {
     private final HttpServer server;
     private final DaoImpl dao;
     private final Logger logger = LoggerFactory.getLogger("service");
-    private final ExecutorService executor;
 
     KVServiceImpl(int port) {
         dao = new DaoImpl("storage.db");
-        executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
         try {
             server = HttpServer.create(new InetSocketAddress(port), 0);
-            server.setExecutor(executor);
+            server.setExecutor(java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor());
             server.createContext("/v0/entity", this::handleEntity);
             server.createContext("/v0/status", this::handleStatus);
         } catch (IOException e) {
@@ -126,7 +122,6 @@ public final class KVServiceImpl implements KVService {
     @Override
     public void stop() {
         server.stop(0);
-        executor.shutdown();
         try {
             dao.close();
         } catch (IOException e) {

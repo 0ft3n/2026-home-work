@@ -91,19 +91,23 @@ public class DaoImpl implements Dao<byte[]> {
                 new BufferedInputStream(Files.newInputStream(storage)))) {
             int size = in.readInt();
             for (int i = 0; i < size; i++) {
-                int keyLen = in.readInt();
-                byte[] keyBytes = new byte[keyLen];
-                in.readFully(keyBytes);
-                String key = new String(keyBytes, StandardCharsets.UTF_8);
-                int valueLen = in.readInt();
-                byte[] value = new byte[valueLen];
-                in.readFully(value);
-                loadedStorage.put(key, value);
+                readEntry(in);
             }
 
             if (logger.isInfoEnabled()) {
                 logger.info("Loaded {} entries from file", loadedStorage.size());
             }
         }
+    }
+
+    private void readEntry(DataInputStream in) throws IOException {
+        int keyLen = in.readInt();
+        byte[] keyBytes = new byte[keyLen];
+        in.readFully(keyBytes);
+        String key = new String(keyBytes, StandardCharsets.UTF_8);
+        int valueLen = in.readInt();
+        byte[] value = new byte[valueLen];
+        in.readFully(value);
+        loadedStorage.put(key, value);
     }
 }
