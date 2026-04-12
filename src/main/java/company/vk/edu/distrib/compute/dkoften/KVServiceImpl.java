@@ -18,7 +18,7 @@ public final class KVServiceImpl implements KVService {
     private final Logger logger = LoggerFactory.getLogger("service");
 
     KVServiceImpl(int port) {
-        dao = new DaoImpl("storage.db");
+        dao = new DaoImpl(System.getProperty("user.home") + java.io.File.separator + "storage.db");
         try {
             server = HttpServer.create(new InetSocketAddress(port), 0);
             server.setExecutor(java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor());
