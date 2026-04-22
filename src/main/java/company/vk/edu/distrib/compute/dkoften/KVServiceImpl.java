@@ -4,21 +4,52 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import company.vk.edu.distrib.compute.KVService;
 import company.vk.edu.distrib.compute.KVServiceFactory;
+import company.vk.edu.distrib.compute.dkoften.sharding.KVClusterImpl;
+import company.vk.edu.distrib.compute.dkoften.sharding.ShardingBalancer;
+import company.vk.edu.distrib.compute.dkoften.storage.DaoImpl;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.InetSocketAddress;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
 import java.util.NoSuchElementException;
 
 public final class KVServiceImpl implements KVService {
     private final HttpServer server;
+    private final HttpClient client;
+    @Nullable
+    private final ShardingBalancer balancer;
     private final DaoImpl dao;
     private final Logger logger = LoggerFactory.getLogger("service");
+    @Nullable
+    private final KVClusterImpl cluster;
+    private static final String IS_PROXY_HEADER = "X-Cluster-Proxied";
 
     KVServiceImpl(int port) {
-        dao = new DaoImpl(System.getProperty("user.home") + java.io.File.separator + "storage.db");
+        this(
+                port,
+                HttpClient.newHttpClient(),
+                null
+        );
+    }
+
+    KVServiceImpl(
+            int port,
+            HttpClient client,
+            @Nullable KVClusterImpl cluster
+    ) {
+        this.cluster = cluster;
+        if (cluster != null) {
+            this.balancer = new ShardingBalancer();
+        } else {
+            this.balancer = null;
+        }
+        dao = new DaoImpl(System.getProperty("user.home") + java.io.File.separator + "storage-" + port + ".db");
+        this.client = client;
         try {
             server = HttpServer.create(new InetSocketAddress(port), 0);
             server.setExecutor(java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor());
@@ -56,7 +87,7 @@ public final class KVServiceImpl implements KVService {
         }
     }
 
-    private void handleRequest(HttpExchange exchange) throws IOException {
+    private void handleRequest(HttpExchange exchange) throws IOException, InterruptedException {
         String method = exchange.getRequestMethod();
 
         if (logger.isDebugEnabled()) {
@@ -75,7 +106,13 @@ public final class KVServiceImpl implements KVService {
             return;
         }
 
-        handleMethod(exchange, method, key);
+        boolean shouldProxy = cluster != null && !isInternalExchange(exchange) && balancer != null;
+
+        if (shouldProxy) {
+            handleProxyMethod(exchange, method, key);
+        } else {
+            handleMethod(exchange, method, key);
+        }
     }
 
     private void handleMethod(HttpExchange exchange, String method, String key) throws IOException {
@@ -89,6 +126,28 @@ public final class KVServiceImpl implements KVService {
             case "DELETE":
                 dao.delete(key);
                 exchange.sendResponseHeaders(202, 0);
+                break;
+            default:
+                exchange.sendResponseHeaders(405, 0);
+                break;
+        }
+    }
+
+    private void handleProxyMethod(HttpExchange exchange, String method, String key) throws IOException,
+            InterruptedException {
+        assert balancer != null;
+        assert cluster != null;
+        String endpoint = balancer.selectFor(cluster.getEndpoints(), key);
+
+        switch (method) {
+            case "GET":
+                proxyGet(exchange, key, endpoint);
+                break;
+            case "PUT":
+                proxyPut(exchange, key, endpoint);
+                break;
+            case "DELETE":
+                proxyDelete(exchange, key, endpoint);
                 break;
             default:
                 exchange.sendResponseHeaders(405, 0);
@@ -114,9 +173,67 @@ public final class KVServiceImpl implements KVService {
         exchange.sendResponseHeaders(201, 0);
     }
 
+    private void proxyGet(HttpExchange exchange, String key, String endpoint) throws IOException, InterruptedException {
+        var request = HttpRequest.newBuilder()
+                .uri(java.net.URI.create(endpoint + "/v0/entity?id=" + key))
+                .header(IS_PROXY_HEADER, "true")
+                .GET()
+                .build();
+
+        var response = this.client.send(request, java.net.http.HttpResponse.BodyHandlers.ofByteArray());
+        exchange.sendResponseHeaders(response.statusCode(), response.body().length);
+        if (logger.isDebugEnabled()) {
+            logger.debug("Proxied GET request for key {} to endpoint {}, received status {}, value length {}", key,
+                    endpoint, response.statusCode(), response.body().length);
+        }
+        exchange.getResponseBody().write(response.body());
+    }
+
+    private void proxyPut(HttpExchange exchange, String key, String endpoint) throws IOException, InterruptedException {
+        byte[] newValue = exchange.getRequestBody().readAllBytes();
+        var request = HttpRequest.newBuilder()
+                .uri(java.net.URI.create(endpoint + "/v0/entity?id=" + key))
+                .header(IS_PROXY_HEADER, "true")
+                .PUT(HttpRequest.BodyPublishers.ofByteArray(newValue))
+                .build();
+
+        var response = this.client.send(request, java.net.http.HttpResponse.BodyHandlers.discarding());
+        exchange.sendResponseHeaders(response.statusCode(), 0);
+        if (logger.isDebugEnabled()) {
+            logger.debug("Proxied PUT request for key {} to endpoint {}, received status {}", key, endpoint,
+                    response.statusCode());
+        }
+    }
+
+    private void proxyDelete(HttpExchange exchange, String key, String endpoint) throws IOException,
+            InterruptedException {
+        var request = HttpRequest.newBuilder()
+                .uri(java.net.URI.create(endpoint + "/v0/entity?id=" + key))
+                .header(IS_PROXY_HEADER, "true")
+                .DELETE()
+                .build();
+
+        var response = this.client.send(request, java.net.http.HttpResponse.BodyHandlers.discarding());
+        exchange.sendResponseHeaders(response.statusCode(), 0);
+        if (logger.isDebugEnabled()) {
+            logger.debug("Proxied DELETE request for key {} to endpoint {}, received status {}", key, endpoint,
+                    response.statusCode());
+        }
+    }
+
+    private boolean isInternalExchange(HttpExchange exchange) {
+        return exchange.getRequestHeaders().containsKey(IS_PROXY_HEADER);
+    }
+
     @Override
     public void start() {
-        server.start();
+        try {
+            server.start();
+        } catch (IllegalStateException ignored) {
+            if (logger.isDebugEnabled()) {
+                logger.debug("Tried starting an already running service");
+            }
+        }
     }
 
     @Override
@@ -135,6 +252,10 @@ public final class KVServiceImpl implements KVService {
         @Override
         protected KVService doCreate(int port) throws IOException {
             return new KVServiceImpl(port);
+        }
+
+        public KVService create(int port, KVClusterImpl cluster) throws IOException {
+            return new KVServiceImpl(port, HttpClient.newHttpClient(), cluster);
         }
     }
 }
