@@ -4,6 +4,7 @@ import company.vk.edu.distrib.compute.dkoften.sharding.strategies.ModuloSharding
 import company.vk.edu.distrib.compute.dkoften.sharding.strategies.RendezvousShardingStrategy;
 
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 
 public final class ShardingBalancer {
@@ -17,7 +18,7 @@ public final class ShardingBalancer {
     private final ShardingStrategy strategy;
 
     public ShardingBalancer() {
-        String strategyName = System.getProperty(STRATEGY_PROPERTY, "RENDEZVOUS").toUpperCase();
+        String strategyName = System.getProperty(STRATEGY_PROPERTY, "RENDEZVOUS").toUpperCase(Locale.ROOT);
         StrategyType strategyType = StrategyType.valueOf(strategyName);
         this.strategy = createStrategy(strategyType);
     }

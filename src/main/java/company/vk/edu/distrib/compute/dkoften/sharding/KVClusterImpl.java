@@ -16,7 +16,7 @@ public final class KVClusterImpl implements KVCluster {
     private final Map<String, Integer> endpointPorts;
     private final KVServiceImpl.Factory factory = new KVServiceImpl.Factory();
 
-    private KVClusterImpl(List<Integer> ports) {
+    KVClusterImpl(List<Integer> ports) {
         nodes = new HashMap<>();
         endpointPorts = new HashMap<>();
         for (var port : ports) {

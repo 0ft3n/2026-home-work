@@ -43,11 +43,7 @@ public final class KVServiceImpl implements KVService {
             @Nullable KVClusterImpl cluster
     ) {
         this.cluster = cluster;
-        if (cluster != null) {
-            this.balancer = new ShardingBalancer();
-        } else {
-            this.balancer = null;
-        }
+        this.balancer = cluster != null ? new ShardingBalancer() : null;
         dao = new DaoImpl(System.getProperty("user.home") + java.io.File.separator + "storage-" + port + ".db");
         this.client = client;
         try {
