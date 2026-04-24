@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import company.vk.edu.distrib.compute.KVService;
 import company.vk.edu.distrib.compute.KVServiceFactory;
+import company.vk.edu.distrib.compute.ReplicatedService;
 import company.vk.edu.distrib.compute.dkoften.sharding.KVClusterImpl;
 import company.vk.edu.distrib.compute.dkoften.sharding.ShardingBalancer;
 import company.vk.edu.distrib.compute.dkoften.storage.DaoImpl;
@@ -18,7 +19,8 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.util.NoSuchElementException;
 
-public final class KVServiceImpl implements KVService {
+@SuppressWarnings("PMD.GodClass")
+public final class KVServiceImpl implements ReplicatedService {
     private final HttpServer server;
     private final HttpClient client;
     @Nullable
@@ -28,6 +30,7 @@ public final class KVServiceImpl implements KVService {
     @Nullable
     private final KVClusterImpl cluster;
     private static final String IS_PROXY_HEADER = "X-Cluster-Proxied";
+    private final int port;
 
     KVServiceImpl(int port) {
         this(
@@ -42,6 +45,7 @@ public final class KVServiceImpl implements KVService {
             HttpClient client,
             @Nullable KVClusterImpl cluster
     ) {
+        this.port = port;
         this.cluster = cluster;
         this.balancer = cluster != null ? new ShardingBalancer() : null;
         dao = new DaoImpl(System.getProperty("user.home") + java.io.File.separator + "storage-" + port + ".db");
@@ -244,10 +248,30 @@ public final class KVServiceImpl implements KVService {
         }
     }
 
+    @Override
+    public int port() {
+        return this.port;
+    }
+
+    @Override
+    public int numberOfReplicas() {
+        return 0;
+    }
+
+    @Override
+    public void disableReplica(int nodeId) {
+        // Not applicable in sharding mode — replica management is handled by ReplicatedKVServiceImpl
+    }
+
+    @Override
+    public void enableReplica(int nodeId) {
+        // Not applicable in sharding mode — replica management is handled by ReplicatedKVServiceImpl
+    }
+
     public static class Factory extends KVServiceFactory {
         @Override
         protected KVService doCreate(int port) throws IOException {
-            return new KVServiceImpl(port);
+            return new ReplicatedKVServiceImpl(port);
         }
 
         public KVService create(int port, KVClusterImpl cluster) throws IOException {
