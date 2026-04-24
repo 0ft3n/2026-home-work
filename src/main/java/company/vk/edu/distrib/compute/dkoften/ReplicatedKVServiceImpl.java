@@ -22,60 +22,40 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
-/**
- * Реализация {@link ReplicatedService}: хранит {@code n} независимых реплик в памяти.
- *
- * <p>Особенности:
- * <ul>
- *   <li>Параллельный I/O — операции с репликами выполняются через виртуальные потоки.</li>
- *   <li>Last-Write-Wins на основе монотонного счётчика.</li>
- *   <li>Эндпоинты статистики:
- *     {@code GET /stats/replica/{id}} и {@code GET /stats/replica/{id}/access}.</li>
- * </ul>
- *
- * <p>Количество реплик задаётся системным свойством {@code dkoften.replicas} (по умолчанию 3).
- */
+@SuppressWarnings("PMD.GodClass")
 public final class ReplicatedKVServiceImpl implements ReplicatedService {
 
     private static final int DEFAULT_REPLICAS = Integer.getInteger("dkoften.replicas", 3);
     private static final Logger LOG = LoggerFactory.getLogger(ReplicatedKVServiceImpl.class);
 
-    /** Монотонный счётчик — гарантирует строгий порядок записей в рамках одного JVM. */
+    private static final String METHOD_GET = "GET";
+    private static final String METHOD_PUT = "PUT";
+    private static final String METHOD_DELETE = "DELETE";
+    private static final String DISABLED_MSG = "disabled";
+
     private static final AtomicLong CLOCK = new AtomicLong();
 
-    private final int port;
+    private static final CompletableFuture<VersionedEntry> DISABLED_FUTURE_READ =
+            CompletableFuture.failedFuture(new IllegalStateException(DISABLED_MSG));
+    private static final CompletableFuture<Void> DISABLED_FUTURE_WRITE =
+            CompletableFuture.failedFuture(new IllegalStateException(DISABLED_MSG));
+
+    private final int serverPort;
     private final int numReplicas;
     private final HttpServer server;
 
-    /** Пул виртуальных потоков для параллельных операций с репликами. */
     private final ExecutorService replicaExecutor = Executors.newVirtualThreadPerTaskExecutor();
-
-    // -----------------------------------------------------------------------
-    // Данные реплик
-    // -----------------------------------------------------------------------
 
     @SuppressWarnings({"unchecked", "rawtypes"})
     private final Map<String, VersionedEntry>[] replicaData;
     private final AtomicBoolean[] replicaEnabled;
 
-    // -----------------------------------------------------------------------
-    // Статистика
-    // -----------------------------------------------------------------------
-
     private final AtomicLong[] readCount;
     private final AtomicLong[] writeCount;
     private final AtomicLong[] deleteCount;
 
-    // -----------------------------------------------------------------------
-    // Внутренний тип
-    // -----------------------------------------------------------------------
-
     private record VersionedEntry(byte[] value, long timestamp, boolean deleted) {
     }
-
-    // -----------------------------------------------------------------------
-    // Конструкторы
-    // -----------------------------------------------------------------------
 
     ReplicatedKVServiceImpl(int port) {
         this(port, DEFAULT_REPLICAS);
@@ -83,7 +63,7 @@ public final class ReplicatedKVServiceImpl implements ReplicatedService {
 
     @SuppressWarnings({"unchecked", "rawtypes"})
     ReplicatedKVServiceImpl(int port, int numReplicas) {
-        this.port = port;
+        this.serverPort = port;
         this.numReplicas = numReplicas;
         this.replicaData = new Map[numReplicas];
         this.replicaEnabled = new AtomicBoolean[numReplicas];
@@ -110,10 +90,6 @@ public final class ReplicatedKVServiceImpl implements ReplicatedService {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // HTTP: /v0/status
-    // -----------------------------------------------------------------------
-
     private void handleStatus(HttpExchange exchange) {
         try (exchange) {
             exchange.sendResponseHeaders(200, 0);
@@ -121,10 +97,6 @@ public final class ReplicatedKVServiceImpl implements ReplicatedService {
             throw new UncheckedIOException(e);
         }
     }
-
-    // -----------------------------------------------------------------------
-    // HTTP: /v0/entity
-    // -----------------------------------------------------------------------
 
     private void handleEntity(HttpExchange exchange) {
         try (exchange) {
@@ -141,6 +113,29 @@ public final class ReplicatedKVServiceImpl implements ReplicatedService {
         }
     }
 
+    private String parseId(String rawQuery) {
+        for (String param : rawQuery.split("&")) {
+            if (param.startsWith("id=")) {
+                String id = param.substring(3);
+                return id.isEmpty() ? null : id;
+            }
+        }
+        return null;
+    }
+
+    private int parseAck(String rawQuery) {
+        for (String param : rawQuery.split("&")) {
+            if (param.startsWith("ack=")) {
+                try {
+                    return Integer.parseInt(param.substring(4));
+                } catch (NumberFormatException e) {
+                    return -1;
+                }
+            }
+        }
+        return 1;
+    }
+
     private void handleRequest(HttpExchange exchange) throws IOException {
         String rawQuery = exchange.getRequestURI().getQuery();
         if (rawQuery == null) {
@@ -148,58 +143,48 @@ public final class ReplicatedKVServiceImpl implements ReplicatedService {
             return;
         }
 
-        String id = null;
-        int ack = 1;
-
-        for (String param : rawQuery.split("&")) {
-            if (param.startsWith("id=")) {
-                id = param.substring(3);
-            } else if (param.startsWith("ack=")) {
-                try {
-                    ack = Integer.parseInt(param.substring(4));
-                } catch (NumberFormatException e) {
-                    sendEmpty(exchange, 400);
-                    return;
-                }
-            }
-        }
-
-        if (id == null || id.isEmpty()) {
+        String id = parseId(rawQuery);
+        if (id == null) {
             sendEmpty(exchange, 400);
             return;
         }
 
+        int ack = parseAck(rawQuery);
         if (ack < 1 || ack > numReplicas) {
             sendEmpty(exchange, 400);
             return;
         }
 
+        dispatchMethod(exchange, id, ack);
+    }
+
+    private void dispatchMethod(HttpExchange exchange, String id, int ack) throws IOException {
         switch (exchange.getRequestMethod()) {
-            case "GET" -> handleGet(exchange, id, ack);
-            case "PUT" -> handlePut(exchange, id, ack);
-            case "DELETE" -> handleDelete(exchange, id, ack);
+            case METHOD_GET -> handleGet(exchange, id, ack);
+            case METHOD_PUT -> handlePut(exchange, id, ack);
+            case METHOD_DELETE -> handleDelete(exchange, id, ack);
             default -> sendEmpty(exchange, 405);
         }
     }
 
-    // -----------------------------------------------------------------------
-    // GET — параллельное чтение из реплик
-    // -----------------------------------------------------------------------
-
-    private void handleGet(HttpExchange exchange, String id, int ack) throws IOException {
+    private List<CompletableFuture<VersionedEntry>> buildReadFutures(String id) {
         List<CompletableFuture<VersionedEntry>> futures = new ArrayList<>(numReplicas);
-
         for (int i = 0; i < numReplicas; i++) {
             final int idx = i;
-            if (!replicaEnabled[idx].get()) {
-                futures.add(CompletableFuture.failedFuture(new IllegalStateException("disabled")));
-                continue;
+            if (replicaEnabled[idx].get()) {
+                futures.add(CompletableFuture.supplyAsync(() -> {
+                    readCount[idx].incrementAndGet();
+                    return replicaData[idx].get(id);
+                }, replicaExecutor));
+            } else {
+                futures.add(DISABLED_FUTURE_READ);
             }
-            futures.add(CompletableFuture.supplyAsync(() -> {
-                readCount[idx].incrementAndGet();
-                return replicaData[idx].get(id); // null если не найдено
-            }, replicaExecutor));
         }
+        return futures;
+    }
+
+    private void handleGet(HttpExchange exchange, String id, int ack) throws IOException {
+        List<CompletableFuture<VersionedEntry>> futures = buildReadFutures(id);
 
         int confirmed = 0;
         VersionedEntry best = null;
@@ -230,51 +215,45 @@ public final class ReplicatedKVServiceImpl implements ReplicatedService {
         exchange.getResponseBody().write(value);
     }
 
-    // -----------------------------------------------------------------------
-    // PUT — параллельная запись в реплики
-    // -----------------------------------------------------------------------
-
     private void handlePut(HttpExchange exchange, String id, int ack) throws IOException {
         byte[] value = exchange.getRequestBody().readAllBytes();
         long ts = CLOCK.incrementAndGet();
+        VersionedEntry newEntry = new VersionedEntry(value, ts, false);
 
         List<CompletableFuture<Void>> futures = new ArrayList<>(numReplicas);
         for (int i = 0; i < numReplicas; i++) {
             final int idx = i;
-            if (!replicaEnabled[idx].get()) {
-                futures.add(CompletableFuture.failedFuture(new IllegalStateException("disabled")));
-                continue;
+            if (replicaEnabled[idx].get()) {
+                futures.add(CompletableFuture.runAsync(() -> {
+                    replicaData[idx].merge(id, newEntry,
+                            (ex, cand) -> cand.timestamp() > ex.timestamp() ? cand : ex);
+                    writeCount[idx].incrementAndGet();
+                }, replicaExecutor));
+            } else {
+                futures.add(DISABLED_FUTURE_WRITE);
             }
-            futures.add(CompletableFuture.runAsync(() -> {
-                replicaData[idx].merge(id, new VersionedEntry(value, ts, false),
-                        (ex, cand) -> cand.timestamp() > ex.timestamp() ? cand : ex);
-                writeCount[idx].incrementAndGet();
-            }, replicaExecutor));
         }
 
         int confirmed = countSuccesses(futures);
         sendEmpty(exchange, confirmed >= ack ? 201 : 500);
     }
 
-    // -----------------------------------------------------------------------
-    // DELETE — параллельное удаление из реплик
-    // -----------------------------------------------------------------------
-
     private void handleDelete(HttpExchange exchange, String id, int ack) throws IOException {
         long ts = CLOCK.incrementAndGet();
+        VersionedEntry tombstone = new VersionedEntry(null, ts, true);
 
         List<CompletableFuture<Void>> futures = new ArrayList<>(numReplicas);
         for (int i = 0; i < numReplicas; i++) {
             final int idx = i;
-            if (!replicaEnabled[idx].get()) {
-                futures.add(CompletableFuture.failedFuture(new IllegalStateException("disabled")));
-                continue;
+            if (replicaEnabled[idx].get()) {
+                futures.add(CompletableFuture.runAsync(() -> {
+                    replicaData[idx].merge(id, tombstone,
+                            (ex, cand) -> cand.timestamp() > ex.timestamp() ? cand : ex);
+                    deleteCount[idx].incrementAndGet();
+                }, replicaExecutor));
+            } else {
+                futures.add(DISABLED_FUTURE_WRITE);
             }
-            futures.add(CompletableFuture.runAsync(() -> {
-                replicaData[idx].merge(id, new VersionedEntry(null, ts, true),
-                        (ex, cand) -> cand.timestamp() > ex.timestamp() ? cand : ex);
-                deleteCount[idx].incrementAndGet();
-            }, replicaExecutor));
         }
 
         int confirmed = countSuccesses(futures);
@@ -294,20 +273,14 @@ public final class ReplicatedKVServiceImpl implements ReplicatedService {
         return count;
     }
 
-    // -----------------------------------------------------------------------
-    // HTTP: /stats/replica/{id}[/access]
-    // -----------------------------------------------------------------------
-
     private void handleStats(HttpExchange exchange) {
         try (exchange) {
-            if (!"GET".equals(exchange.getRequestMethod())) {
+            if (!METHOD_GET.equals(exchange.getRequestMethod())) {
                 sendEmpty(exchange, 405);
                 return;
             }
 
-            // Путь вида: /stats/replica/0  или  /stats/replica/0/access
             String path = exchange.getRequestURI().getPath();
-            // Убираем ведущий /stats/replica/
             String tail = path.replaceFirst("^/stats/replica/", "");
             boolean accessMode = tail.endsWith("/access");
             String idPart = accessMode ? tail.substring(0, tail.length() - "/access".length()) : tail;
@@ -325,13 +298,7 @@ public final class ReplicatedKVServiceImpl implements ReplicatedService {
                 return;
             }
 
-            String body;
-            if (accessMode) {
-                body = buildAccessJson(replicaId);
-            } else {
-                body = buildInfoJson(replicaId);
-            }
-
+            String body = accessMode ? buildAccessJson(replicaId) : buildInfoJson(replicaId);
             byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
             exchange.sendResponseHeaders(200, bytes.length);
@@ -341,11 +308,6 @@ public final class ReplicatedKVServiceImpl implements ReplicatedService {
         }
     }
 
-    /**
-     * Формирует JSON с информацией о реплике: кол-во ключей, размер данных, статус.
-     *
-     * <p>Пример: {@code {"replicaId":0,"keys":42,"dataBytes":4096,"enabled":true}}
-     */
     private String buildInfoJson(int replicaId) {
         Map<String, VersionedEntry> data = replicaData[replicaId];
         long keyCount = data.values().stream().filter(e -> !e.deleted()).count();
@@ -359,11 +321,6 @@ public final class ReplicatedKVServiceImpl implements ReplicatedService {
                 replicaId, keyCount, dataBytes, enabled);
     }
 
-    /**
-     * Формирует JSON с частотой обращений к реплике: чтения, записи, удаления.
-     *
-     * <p>Пример: {@code {"replicaId":0,"reads":100,"writes":50,"deletes":5}}
-     */
     private String buildAccessJson(int replicaId) {
         return String.format(
                 "{\"replicaId\":%d,\"reads\":%d,\"writes\":%d,\"deletes\":%d}",
@@ -373,21 +330,13 @@ public final class ReplicatedKVServiceImpl implements ReplicatedService {
                 deleteCount[replicaId].get());
     }
 
-    // -----------------------------------------------------------------------
-    // Утилиты
-    // -----------------------------------------------------------------------
-
     private static void sendEmpty(HttpExchange exchange, int code) throws IOException {
         exchange.sendResponseHeaders(code, 0);
     }
 
-    // -----------------------------------------------------------------------
-    // ReplicatedService
-    // -----------------------------------------------------------------------
-
     @Override
     public int port() {
-        return port;
+        return serverPort;
     }
 
     @Override
@@ -411,14 +360,10 @@ public final class ReplicatedKVServiceImpl implements ReplicatedService {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // KVService
-    // -----------------------------------------------------------------------
-
     @Override
     public void start() {
         server.start();
-        LOG.info("ReplicatedKVService started on port {} with {} replicas", port, numReplicas);
+        LOG.info("ReplicatedKVService started on port {} with {} replicas", serverPort, numReplicas);
     }
 
     @Override
@@ -427,10 +372,6 @@ public final class ReplicatedKVServiceImpl implements ReplicatedService {
         replicaExecutor.close();
         LOG.info("ReplicatedKVService stopped");
     }
-
-    // -----------------------------------------------------------------------
-    // Фабрика
-    // -----------------------------------------------------------------------
 
     public static final class ReplicatedFactory extends KVServiceFactory {
 

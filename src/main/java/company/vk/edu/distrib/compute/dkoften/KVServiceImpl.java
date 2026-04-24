@@ -30,7 +30,7 @@ public final class KVServiceImpl implements ReplicatedService {
     @Nullable
     private final KVClusterImpl cluster;
     private static final String IS_PROXY_HEADER = "X-Cluster-Proxied";
-    private final int port;
+    private final int serverPort;
 
     KVServiceImpl(int port) {
         this(
@@ -45,7 +45,7 @@ public final class KVServiceImpl implements ReplicatedService {
             HttpClient client,
             @Nullable KVClusterImpl cluster
     ) {
-        this.port = port;
+        this.serverPort = port;
         this.cluster = cluster;
         this.balancer = cluster != null ? new ShardingBalancer() : null;
         dao = new DaoImpl(System.getProperty("user.home") + java.io.File.separator + "storage-" + port + ".db");
@@ -250,7 +250,7 @@ public final class KVServiceImpl implements ReplicatedService {
 
     @Override
     public int port() {
-        return this.port;
+        return this.serverPort;
     }
 
     @Override
