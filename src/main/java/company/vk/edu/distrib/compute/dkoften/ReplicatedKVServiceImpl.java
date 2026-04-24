@@ -183,9 +183,10 @@ public final class ReplicatedKVServiceImpl implements ReplicatedService {
         return futures;
     }
 
-    private void handleGet(HttpExchange exchange, String id, int ack) throws IOException {
-        List<CompletableFuture<VersionedEntry>> futures = buildReadFutures(id);
+    private record ReadResult(int confirmed, VersionedEntry best) {
+    }
 
+    private ReadResult collectReadResults(List<CompletableFuture<VersionedEntry>> futures) {
         int confirmed = 0;
         VersionedEntry best = null;
         for (CompletableFuture<VersionedEntry> f : futures) {
@@ -199,20 +200,26 @@ public final class ReplicatedKVServiceImpl implements ReplicatedService {
                 // реплика недоступна — не считается
             }
         }
+        return new ReadResult(confirmed, best);
+    }
 
-        if (confirmed < ack) {
-            sendEmpty(exchange, 500);
-            return;
-        }
-
+    private void sendGetResponse(HttpExchange exchange, VersionedEntry best) throws IOException {
         if (best == null || best.deleted()) {
             sendEmpty(exchange, 404);
             return;
         }
-
         byte[] value = best.value();
         exchange.sendResponseHeaders(200, value.length);
         exchange.getResponseBody().write(value);
+    }
+
+    private void handleGet(HttpExchange exchange, String id, int ack) throws IOException {
+        ReadResult result = collectReadResults(buildReadFutures(id));
+        if (result.confirmed() < ack) {
+            sendEmpty(exchange, 500);
+            return;
+        }
+        sendGetResponse(exchange, result.best());
     }
 
     private void handlePut(HttpExchange exchange, String id, int ack) throws IOException {
