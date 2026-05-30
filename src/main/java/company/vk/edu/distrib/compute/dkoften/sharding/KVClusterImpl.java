@@ -20,7 +20,8 @@ public final class KVClusterImpl implements KVCluster {
         nodes = new HashMap<>();
         endpointPorts = new HashMap<>();
         for (var port : ports) {
-            var endpoint = "http://localhost:" + port;
+            int grpcPort = port + 1000;
+            var endpoint = "http://localhost:" + port + "?grpcPort=" + grpcPort;
             endpointPorts.put(endpoint, port);
             try {
                 nodes.put(endpoint, factory.create(port, this));

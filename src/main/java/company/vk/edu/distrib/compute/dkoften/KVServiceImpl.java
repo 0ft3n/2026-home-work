@@ -5,6 +5,13 @@ import com.sun.net.httpserver.HttpServer;
 import company.vk.edu.distrib.compute.KVService;
 import company.vk.edu.distrib.compute.KVServiceFactory;
 import company.vk.edu.distrib.compute.ReplicatedService;
+import company.vk.edu.distrib.compute.dkoften.grpc.DeleteRequest;
+import company.vk.edu.distrib.compute.dkoften.grpc.GetRequest;
+import company.vk.edu.distrib.compute.dkoften.grpc.GetResponse;
+import company.vk.edu.distrib.compute.dkoften.grpc.GrpcClientManager;
+import company.vk.edu.distrib.compute.dkoften.grpc.GrpcKVServiceImpl;
+import company.vk.edu.distrib.compute.dkoften.grpc.GrpcServerManager;
+import company.vk.edu.distrib.compute.dkoften.grpc.PutRequest;
 import company.vk.edu.distrib.compute.dkoften.sharding.KVClusterImpl;
 import company.vk.edu.distrib.compute.dkoften.sharding.ShardingBalancer;
 import company.vk.edu.distrib.compute.dkoften.storage.DaoImpl;
@@ -15,41 +22,36 @@ import javax.annotation.Nullable;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.InetSocketAddress;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
 import java.util.NoSuchElementException;
 
-@SuppressWarnings("PMD.GodClass")
 public final class KVServiceImpl implements ReplicatedService {
     private final HttpServer server;
-    private final HttpClient client;
+    private final GrpcServerManager grpcServer;
+    private final GrpcClientManager grpcClient;
     @Nullable
     private final ShardingBalancer balancer;
     private final DaoImpl dao;
     private final Logger logger = LoggerFactory.getLogger("service");
     @Nullable
     private final KVClusterImpl cluster;
-    private static final String IS_PROXY_HEADER = "X-Cluster-Proxied";
     private final int serverPort;
+    private final int grpcPort;
 
     KVServiceImpl(int port) {
-        this(
-                port,
-                HttpClient.newHttpClient(),
-                null
-        );
+        this(port, null);
     }
 
-    KVServiceImpl(
-            int port,
-            HttpClient client,
-            @Nullable KVClusterImpl cluster
-    ) {
+    KVServiceImpl(int port, @Nullable KVClusterImpl cluster) {
         this.serverPort = port;
+        this.grpcPort = port + 1000;
         this.cluster = cluster;
         this.balancer = cluster != null ? new ShardingBalancer() : null;
         dao = new DaoImpl(System.getProperty("user.home") + java.io.File.separator + "storage-" + port + ".db");
-        this.client = client;
+        this.grpcClient = new GrpcClientManager();
+
+        GrpcKVServiceImpl grpcService = new GrpcKVServiceImpl(dao);
+        this.grpcServer = new GrpcServerManager(grpcPort, grpcService);
+
         try {
             server = HttpServer.create(new InetSocketAddress(port), 0);
             server.setExecutor(java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor());
@@ -106,7 +108,7 @@ public final class KVServiceImpl implements ReplicatedService {
             return;
         }
 
-        boolean shouldProxy = cluster != null && !isInternalExchange(exchange) && balancer != null;
+        boolean shouldProxy = cluster != null && balancer != null;
 
         if (shouldProxy) {
             handleProxyMethod(exchange, method, key);
@@ -173,61 +175,79 @@ public final class KVServiceImpl implements ReplicatedService {
         exchange.sendResponseHeaders(201, 0);
     }
 
-    private void proxyGet(HttpExchange exchange, String key, String endpoint) throws IOException, InterruptedException {
-        var request = HttpRequest.newBuilder()
-                .uri(java.net.URI.create(endpoint + "/v0/entity?id=" + key))
-                .header(IS_PROXY_HEADER, "true")
-                .GET()
-                .build();
+    private void proxyGet(HttpExchange exchange, String key, String endpoint) throws IOException {
+        try {
+            var stub = grpcClient.getStub(endpoint);
+            GetRequest request = GetRequest.newBuilder()
+                    .setKey(key)
+                    .build();
+            GetResponse response = stub.get(request);
 
-        var response = this.client.send(request, java.net.http.HttpResponse.BodyHandlers.ofByteArray());
-        exchange.sendResponseHeaders(response.statusCode(), response.body().length);
-        if (logger.isDebugEnabled()) {
-            logger.debug("Proxied GET request for key {} to endpoint {}, received status {}, value length {}", key,
-                    endpoint, response.statusCode(), response.body().length);
-        }
-        exchange.getResponseBody().write(response.body());
-    }
+            if (logger.isDebugEnabled()) {
+                logger.debug("Proxied GET request for key {} to endpoint {}, received status {}", key, endpoint,
+                        response.getStatus());
+            }
 
-    private void proxyPut(HttpExchange exchange, String key, String endpoint) throws IOException, InterruptedException {
-        byte[] newValue = exchange.getRequestBody().readAllBytes();
-        var request = HttpRequest.newBuilder()
-                .uri(java.net.URI.create(endpoint + "/v0/entity?id=" + key))
-                .header(IS_PROXY_HEADER, "true")
-                .PUT(HttpRequest.BodyPublishers.ofByteArray(newValue))
-                .build();
-
-        var response = this.client.send(request, java.net.http.HttpResponse.BodyHandlers.discarding());
-        exchange.sendResponseHeaders(response.statusCode(), 0);
-        if (logger.isDebugEnabled()) {
-            logger.debug("Proxied PUT request for key {} to endpoint {}, received status {}", key, endpoint,
-                    response.statusCode());
+            exchange.sendResponseHeaders(response.getStatus(), response.getValue().size());
+            exchange.getResponseBody().write(response.getValue().toByteArray());
+        } catch (Exception e) {
+            if (logger.isErrorEnabled()) {
+                logger.error("Error proxying GET request", e);
+            }
+            exchange.sendResponseHeaders(500, 0);
         }
     }
 
-    private void proxyDelete(HttpExchange exchange, String key, String endpoint) throws IOException,
-            InterruptedException {
-        var request = HttpRequest.newBuilder()
-                .uri(java.net.URI.create(endpoint + "/v0/entity?id=" + key))
-                .header(IS_PROXY_HEADER, "true")
-                .DELETE()
-                .build();
+    private void proxyPut(HttpExchange exchange, String key, String endpoint) throws IOException {
+        try {
+            byte[] newValue = exchange.getRequestBody().readAllBytes();
+            var stub = grpcClient.getStub(endpoint);
+            PutRequest request = PutRequest.newBuilder()
+                    .setKey(key)
+                    .setValue(com.google.protobuf.ByteString.copyFrom(newValue))
+                    .build();
+            var response = stub.put(request);
 
-        var response = this.client.send(request, java.net.http.HttpResponse.BodyHandlers.discarding());
-        exchange.sendResponseHeaders(response.statusCode(), 0);
-        if (logger.isDebugEnabled()) {
-            logger.debug("Proxied DELETE request for key {} to endpoint {}, received status {}", key, endpoint,
-                    response.statusCode());
+            if (logger.isDebugEnabled()) {
+                logger.debug("Proxied PUT request for key {} to endpoint {}, received status {}", key, endpoint,
+                        response.getStatus());
+            }
+
+            exchange.sendResponseHeaders(response.getStatus(), 0);
+        } catch (Exception e) {
+            if (logger.isErrorEnabled()) {
+                logger.error("Error proxying PUT request", e);
+            }
+            exchange.sendResponseHeaders(500, 0);
         }
     }
 
-    private boolean isInternalExchange(HttpExchange exchange) {
-        return exchange.getRequestHeaders().containsKey(IS_PROXY_HEADER);
+    private void proxyDelete(HttpExchange exchange, String key, String endpoint) throws IOException {
+        try {
+            var stub = grpcClient.getStub(endpoint);
+            DeleteRequest request = DeleteRequest.newBuilder()
+                    .setKey(key)
+                    .build();
+            var response = stub.delete(request);
+
+            if (logger.isDebugEnabled()) {
+                logger.debug("Proxied DELETE request for key {} to endpoint {}, received status {}", key, endpoint,
+                        response.getStatus());
+            }
+
+            exchange.sendResponseHeaders(response.getStatus(), 0);
+        } catch (Exception e) {
+            if (logger.isErrorEnabled()) {
+                logger.error("Error proxying DELETE request", e);
+            }
+            exchange.sendResponseHeaders(500, 0);
+        }
     }
 
     @Override
     public void start() {
         try {
+            grpcServer.start();
             server.start();
         } catch (IllegalStateException ignored) {
             if (logger.isDebugEnabled()) {
@@ -238,6 +258,8 @@ public final class KVServiceImpl implements ReplicatedService {
 
     @Override
     public void stop() {
+        grpcServer.stop();
+        grpcClient.shutdown();
         server.stop(0);
         try {
             dao.close();
@@ -275,7 +297,7 @@ public final class KVServiceImpl implements ReplicatedService {
         }
 
         public KVService create(int port, KVClusterImpl cluster) throws IOException {
-            return new KVServiceImpl(port, HttpClient.newHttpClient(), cluster);
+            return new KVServiceImpl(port, cluster);
         }
     }
 }
