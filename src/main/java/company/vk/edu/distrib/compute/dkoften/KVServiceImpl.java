@@ -35,7 +35,6 @@ public final class KVServiceImpl implements ReplicatedService {
     @Nullable
     private final KVClusterImpl cluster;
     private final int serverPort;
-    private final int grpcPort;
 
     KVServiceImpl(int port) {
         this(port, null);
@@ -43,12 +42,12 @@ public final class KVServiceImpl implements ReplicatedService {
 
     KVServiceImpl(int port, @Nullable KVClusterImpl cluster) {
         this.serverPort = port;
-        this.grpcPort = port + 1000;
         this.cluster = cluster;
         this.balancer = cluster != null ? new ShardingBalancer() : null;
         dao = new DaoImpl(System.getProperty("user.home") + java.io.File.separator + "storage-" + port + ".db");
         this.grpcClient = new GrpcClientManager();
 
+        int grpcPort = port + 1000;
         GrpcKVServiceImpl grpcService = new GrpcKVServiceImpl(dao);
         this.grpcServer = new GrpcServerManager(grpcPort, grpcService);
 
